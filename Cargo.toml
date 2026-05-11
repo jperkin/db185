@@ -1,0 +1,22 @@
+[package]
+name = "db185"
+description = "Read access to BSD 4.4 dbopen(3) btree (db 1.85) files"
+version = "0.1.0"
+authors = ["Jonathan Perkin <jonathan@perkin.org.uk>"]
+keywords = ["bsd", "btree", "pkgsrc"]
+license = "ISC"
+repository = "https://github.com/jperkin/db185"
+homepage = "https://github.com/jperkin/db185"
+documentation = "https://docs.rs/db185"
+readme = "README.md"
+rust-version = "1.85.1"
+edition = "2024"
+
+[dependencies]
+memmap2 = "0.9.10"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+anyhow = "1.0.102"
+tempfile = "3.27.0"
+zstd = "0.13.3"
