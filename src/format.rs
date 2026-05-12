@@ -20,13 +20,7 @@
  * All field widths and offsets here are taken from `libnbcompat`'s
  * `nbcompat/db.h` and `db/btree/btree.h`.  See those headers for the
  * canonical definitions.
- *
- * The full set of constants is kept here even when the read-only path
- * does not yet reference all of them; the constants serve as the
- * format specification for the upcoming write side.
  */
-
-#![allow(dead_code)]
 
 /// Magic number at the start of `BTMETA` (page 0).  Stored in host byte
 /// order; mismatch on read indicates the file was written with the
@@ -39,16 +33,19 @@ pub(crate) const BTREE_VERSION: u32 = 3;
 /// Smallest legal page size.
 pub(crate) const MIN_PSIZE: usize = 512;
 
-/// Largest legal page size.  Page offsets are stored in `indx_t` which is
-/// `u16`, so a page may be at most 65536 bytes.
-pub(crate) const MAX_PSIZE: usize = 65536;
+/// Largest legal page size.  Page offsets are stored in `indx_t` which
+/// is `u16`; the legacy BSD encoding overloads `0` to mean "psize" so
+/// that a 65536-byte empty page can record `upper = psize` in 16 bits.
+/// pkgsrc only ever uses 4096-byte pages, and the sentinel is a real
+/// trap (the reader has to know when `0` means "the end of the page"
+/// vs. "byte 0"), so this crate just caps psize at 32768 - large
+/// enough for every realistic use, small enough that page offsets
+/// always fit unambiguously in a `u16`.
+pub(crate) const MAX_PSIZE: usize = 32768;
 
 /// Reserved page number used for both the metadata page and for "no
 /// page" sentinels in sibling / overflow links.
 pub(crate) const P_INVALID: u32 = 0;
-
-/// Page number of the `BTMETA` page.
-pub(crate) const P_META: u32 = 0;
 
 /// Page number of the root of the btree.
 pub(crate) const P_ROOT: u32 = 1;
@@ -59,10 +56,6 @@ pub(crate) const P_BINTERNAL: u32 = 0x01;
 pub(crate) const P_BLEAF: u32 = 0x02;
 /// Page flag: overflow page (a member of a key or value overflow chain).
 pub(crate) const P_OVERFLOW: u32 = 0x04;
-/// Page flag: internal page of a recno tree.  Unsupported.
-pub(crate) const P_RINTERNAL: u32 = 0x08;
-/// Page flag: leaf page of a recno tree.  Unsupported.
-pub(crate) const P_RLEAF: u32 = 0x10;
 /// Mask of all page type bits.
 pub(crate) const P_TYPE: u32 = 0x1f;
 
@@ -113,7 +106,12 @@ pub(crate) const fn align_entry(n: usize) -> usize {
     (n + ENTRY_ALIGN - 1) & !(ENTRY_ALIGN - 1)
 }
 
-/// Byte layout of the `BTMETA` page (page 0).
+/// Decoded subset of the `BTMETA` page (page 0).
+///
+/// The `free` (free-page chain head) and `nrecs` (recno-only record
+/// count) fields of the on-disk struct are skipped: the reader does
+/// not support recno trees, and the writer always builds a fresh
+/// file with no free chain.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Meta {
     /// Magic number.
@@ -122,10 +120,6 @@ pub(crate) struct Meta {
     pub(crate) version: u32,
     /// Page size in bytes.
     pub(crate) psize: u32,
-    /// Head of the free-page chain, or [`P_INVALID`].
-    pub(crate) free: u32,
-    /// Number of records (recno only; zero for btree).
-    pub(crate) nrecs: u32,
     /// Metadata flag bits (a subset of [`SAVEMETA`]).
     pub(crate) flags: u32,
 }
@@ -149,8 +143,6 @@ impl Meta {
             magic: r(0),
             version: r(4),
             psize: r(8),
-            free: r(12),
-            nrecs: r(16),
             flags: r(20),
         };
         (meta, swap)

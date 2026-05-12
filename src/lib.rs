@@ -15,25 +15,36 @@
  */
 
 /*!
- * Read access to BSD 4.4 `dbopen(3)` btree (db 1.85) files.
+ * Read and write Berkeley DB 1.85 btree files - the on-disk format
+ * used by 4.4BSD's `dbopen(3)` and still shipped today in NetBSD
+ * `libc` and pkgsrc's `libnbcompat`.  Hash and recno access methods
+ * are out of scope.
  *
- * This crate implements the on-disk btree format used by the historical
- * 4.4BSD `dbopen(3)` interface, as preserved in NetBSD `libc` and in the
- * pkgsrc `libnbcompat` sources.  It targets the subset required by
- * `pkg_install`'s `pkgdb.byfile.db`: btree only, no duplicates, default
- * `memcmp` ordering, no user comparison or prefix callbacks.  Hash and
- * recno access methods are not supported.
+ * # Reader
  *
- * Only read operations are implemented in this revision: opening an
- * existing database, retrieving a value by key, and iterating all
- * key/value pairs in sorted order.  Write support will follow.
+ * [`Db`] opens an existing file, retrieves values by key, and
+ * iterates all key/value pairs in sorted order via [`Iter`].  Files
+ * written in either byte order are accepted.
+ *
+ * # Writer
+ *
+ * [`Writer`] builds a new file from scratch via a sequence of
+ * [`Writer::put`] / [`Writer::del`] operations, flushed on
+ * [`Writer::close`].  It does not modify existing files, and writes
+ * native-endian only (the reader handles both byte orders).
+ *
+ * Each key/value pair must fit in a single page (~4 KiB); larger
+ * entries return [`Error::EntryTooLarge`].  This is enough to
+ * rebuild pkgsrc's `pkgdb.byfile.db`, but means this is not a full
+ * Berkeley DB 1.85 writer.
+ *
+ * [`Error::EntryTooLarge`]: crate::Error::EntryTooLarge
  *
  * # Errors
  *
- * Fallible operations return [`Result<T>`], aliased to
- * [`std::result::Result`] over [`Error`].  [`Error`] distinguishes
- * underlying I/O failures from on-disk format problems (bad magic,
- * unsupported version, corrupt pages or overflow chains).
+ * Fallible operations return [`Result<T>`].  [`Error`] distinguishes
+ * I/O failures from on-disk format problems (bad magic, unsupported
+ * version, corrupt pages).
  *
  * # Example
  *
@@ -71,10 +82,12 @@ mod error;
 mod format;
 mod iter;
 mod page;
+mod writer;
 
 pub use db::Db;
 pub use error::Error;
 pub use iter::{Entry, Iter};
+pub use writer::{PutResult, Writer};
 
 /// Result alias for fallible operations in this crate.
 pub type Result<T> = std::result::Result<T, Error>;

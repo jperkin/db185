@@ -29,7 +29,7 @@
  * each entry's bounds are checked on access.
  *
  * Entry payload offsets and lengths are bounded by the page size
- * (`MAX_PSIZE = 65536`), so they fit comfortably in `u32`; the
+ * (`MAX_PSIZE = 32768`), so they fit comfortably in `u32`; the
  * cast-truncation allow inside [`PageView`]'s entry decoder is
  * justified by that invariant.
  */
@@ -90,14 +90,31 @@ pub(crate) enum ItemRef {
 impl<'a> PageView<'a> {
     /// Parse and validate `bytes` as page `pgno`.
     ///
-    /// Decodes the header and checks structural invariants: header
-    /// length, `lower`/`upper` in range, `linp[]` byte-aligned to its
-    /// `u16` elements, and a recognised page type (`P_BINTERNAL`,
-    /// `P_BLEAF` or `P_OVERFLOW`).  Recno page types are rejected.
+    /// Decodes the header and checks the cheap structural
+    /// invariants:
+    ///
+    /// - The slice is at least [`PAGE_HEADER_SIZE`] bytes long.
+    /// - `lower` and `upper` form a valid `(linp-end, entry-start)`
+    ///   pair within the page.
+    /// - `flags & P_TYPE` is `P_BINTERNAL`, `P_BLEAF` or
+    ///   `P_OVERFLOW`.
+    ///
+    /// `linp[i]` is *not* validated up front.  An offset that
+    /// points outside the entry region (or one whose alignment is
+    /// off) will be caught lazily when the entry is accessed: the
+    /// `bytes.get(off..off + n)` calls inside [`PageView::u16_at`]
+    /// / [`PageView::u32_at`] return `None`, which surfaces as a
+    /// [`Error::CorruptPage`] at exactly the same end-user
+    /// granularity but without paying for an `O(nentries)` loop on
+    /// every page parse.  For pkgsrc workloads the source is a
+    /// locally-written `pkgdb.byfile.db`, so the only realistic
+    /// corruption mode is a torn write or disk bit-flip, which the
+    /// lazy path catches the moment the affected entry is read.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::CorruptPage`] if any of the above checks fail.
+    /// Returns [`Error::CorruptPage`] if any of the header-level
+    /// checks above fail.
     pub(crate) fn parse(pgno: u32, bytes: &'a [u8], swap: bool) -> Result<Self> {
         if bytes.len() < PAGE_HEADER_SIZE {
             return Err(Error::CorruptPage {
@@ -194,16 +211,17 @@ impl<'a> PageView<'a> {
         match item {
             ItemRef::Inline { off, len } => {
                 let start = off as usize;
-                let end = start + len as usize;
-                self.bytes.get(start..end).ok_or(Error::CorruptPage {
-                    pgno: self.pgno,
-                    reason: "inline offset out of range",
-                })
+                // `slice::get(Range)` handles overflow internally:
+                // if `start + len` wraps it returns `None` rather
+                // than panicking or aliasing.
+                let end = start
+                    .checked_add(len as usize)
+                    .ok_or_else(|| self.corrupt("inline offset + length overflows"))?;
+                self.bytes
+                    .get(start..end)
+                    .ok_or_else(|| self.corrupt("inline offset out of range"))
             }
-            ItemRef::Overflow { .. } => Err(Error::CorruptPage {
-                pgno: self.pgno,
-                reason: "expected inline item, found overflow",
-            }),
+            ItemRef::Overflow { .. } => Err(self.corrupt("expected inline item, found overflow")),
         }
     }
 
@@ -220,7 +238,15 @@ impl<'a> PageView<'a> {
         let dsize = self.u32_at(off + 4)? as usize;
         let eflags = self.byte_at(off + 8)?;
         let payload = off + BLEAF_HEADER_SIZE;
-        if payload + ksize + dsize > self.bytes.len() {
+        // Use checked arithmetic so a crafted (ksize, dsize) pair
+        // can't wrap on a 32-bit target.  `bytes.len()` is bounded
+        // by `MAX_PSIZE = 32768`, so on the happy path neither
+        // sum nor compare can wrap; the check is defence in depth.
+        let payload_end = payload
+            .checked_add(ksize)
+            .and_then(|p| p.checked_add(dsize))
+            .ok_or_else(|| self.corrupt("leaf payload length overflows"))?;
+        if payload_end > self.bytes.len() {
             return Err(self.corrupt("leaf payload out of range"));
         }
         let key = self.decode_item(payload, ksize, eflags & P_BIGKEY != 0)?;
@@ -239,7 +265,10 @@ impl<'a> PageView<'a> {
         let child = self.u32_at(off + 4)?;
         let eflags = self.byte_at(off + 8)?;
         let payload = off + BINTERNAL_HEADER_SIZE;
-        if payload + ksize > self.bytes.len() {
+        let payload_end = payload
+            .checked_add(ksize)
+            .ok_or_else(|| self.corrupt("internal payload length overflows"))?;
+        if payload_end > self.bytes.len() {
             return Err(self.corrupt("internal payload out of range"));
         }
         let key = self.decode_item(payload, ksize, eflags & P_BIGKEY != 0)?;
@@ -248,22 +277,23 @@ impl<'a> PageView<'a> {
 
     /// Byte offset of entry `idx` within the page, as recorded in
     /// `linp[idx]`.
+    ///
+    /// The offset is not validated for range or alignment here;
+    /// downstream entry decoders bounds-check the payload they
+    /// actually read.  This keeps page parsing constant-time
+    /// regardless of `nentries`.
     fn entry_offset(&self, idx: usize) -> Result<usize> {
         if idx >= self.nentries {
             return Err(self.corrupt("entry index out of range"));
         }
-        let off = self.u16_at(PAGE_HEADER_SIZE + idx * 2)? as usize;
-        if off >= self.bytes.len() {
-            return Err(self.corrupt("linp offset out of range"));
-        }
-        Ok(off)
+        Ok(self.u16_at(PAGE_HEADER_SIZE + idx * 2)? as usize)
     }
 
     /// Decode an item slot at `[off, off + len)`, treating it as an
     /// overflow reference if `big` is set.
     ///
     /// `off` and `len` come from page-internal arithmetic bounded by
-    /// `PageView::bytes.len() <= MAX_PSIZE = 65536`, so the casts to
+    /// `PageView::bytes.len() <= MAX_PSIZE = 32768`, so the casts to
     /// `u32` cannot truncate.
     #[allow(clippy::cast_possible_truncation)]
     fn decode_item(&self, off: usize, len: usize, big: bool) -> Result<ItemRef> {
@@ -291,18 +321,24 @@ impl<'a> PageView<'a> {
 
     #[inline]
     fn u16_at(&self, off: usize) -> Result<u16> {
+        let end = off
+            .checked_add(2)
+            .ok_or_else(|| self.corrupt("u16 offset overflows"))?;
         let b = self
             .bytes
-            .get(off..off + 2)
+            .get(off..end)
             .ok_or_else(|| self.corrupt("u16 read out of range"))?;
         Ok(read_u16_bytes([b[0], b[1]], self.swap))
     }
 
     #[inline]
     fn u32_at(&self, off: usize) -> Result<u32> {
+        let end = off
+            .checked_add(4)
+            .ok_or_else(|| self.corrupt("u32 offset overflows"))?;
         let b = self
             .bytes
-            .get(off..off + 4)
+            .get(off..end)
             .ok_or_else(|| self.corrupt("u32 read out of range"))?;
         Ok(read_u32_bytes([b[0], b[1], b[2], b[3]], self.swap))
     }

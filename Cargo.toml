@@ -1,9 +1,9 @@
 [package]
 name = "db185"
-description = "Read access to BSD 4.4 dbopen(3) btree (db 1.85) files"
-version = "0.1.0"
+description = "Support for Berkeley DB 1.85"
+version = "0.2.0"
 authors = ["Jonathan Perkin <jonathan@perkin.org.uk>"]
-keywords = ["bsd", "btree", "pkgsrc"]
+keywords = ["berkeleydb", "pkgsrc"]
 license = "ISC"
 repository = "https://github.com/jperkin/db185"
 homepage = "https://github.com/jperkin/db185"
@@ -11,6 +11,10 @@ documentation = "https://docs.rs/db185"
 readme = "README.md"
 rust-version = "1.85.1"
 edition = "2024"
+exclude = [
+    "tests/data/",
+    "tools/",
+]
 
 [dependencies]
 memmap2 = "0.9.10"

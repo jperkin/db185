@@ -14,7 +14,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-//! Dump a db 1.85 btree file, or look up a single key.
+//! Dump a Berkeley DB 1.85 btree file, or look up a single key.
 //!
 //! Usage:
 //!

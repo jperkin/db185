@@ -1,21 +1,24 @@
-# Pure Rust reader for BSD 4.4 dbopen(3) btree (db 1.85) files
+# Rust support for Berkeley DB 1.85
 
 [![Crates.io](https://img.shields.io/crates/v/db185.svg)](https://crates.io/crates/db185)
 [![Documentation](https://docs.rs/db185/badge.svg)](https://docs.rs/db185)
 [![License](https://img.shields.io/crates/l/db185.svg)](https://github.com/jperkin/db185)
 
-`db185` reads the on-disk btree format used by the historical 4.4BSD
-`dbopen(3)` interface, as preserved in NetBSD `libc` and the pkgsrc
-`libnbcompat` sources.  It exists because
-[pkgsrc-rs](https://github.com/jperkin/pkgsrc-rs) will need to read pkgsrc's
-`pkgdb.byfile.db`, and the only pre-existing options for doing that are
-NetBSD `libc` (NetBSD-only) or linking against the `libnbcompat` C sources
-(everywhere else).
+`db185` reads and writes Berkeley DB 1.85 btree files - the on-disk
+format used by 4.4BSD's `dbopen(3)` and still shipped today in
+NetBSD `libc` and pkgsrc's `libnbcompat`.  It exists primarily for
+[pkgsrc-rs](https://github.com/jperkin/pkgsrc-rs) to read and update
+pkgsrc's `pkgdb.byfile.db`.
 
-The crate targets only the subset of `dbopen` that `pkgdb.byfile.db`
-actually uses: btree, no duplicates, default `memcmp` ordering, no
-user-supplied compare or prefix callbacks.  Hash and recno access methods
-are not supported and won't be.  Write support will follow.
+What's supported:
+
+- **Reader:** any Berkeley DB 1.85 btree file, in either byte order.
+- **Writer:** builds a new file from scratch.  Each key/value pair
+  must fit in a single page (~4 KiB).  That's enough for pkgsrc
+  and similar workloads where keys are file paths and values are
+  small identifiers; it is not a full Berkeley DB 1.85 writer.
+
+Hash and recno access methods are out of scope.
 
 ```rust
 use db185::Db;
@@ -36,7 +39,17 @@ for entry in &db {
 }
 ```
 
-The bundled `dump` example produces output byte-identical to
-`pkg_admin dump` when run against a `pkgdb.byfile.db`, which is how
-correctness is checked during development.  On a real 199,996-entry
-pkgdb it runs in around 15 ms versus 35 ms for `pkg_admin`.
+## Performance
+
+Numbers from a desktop Apple Silicon machine with a ~190k-entry
+`pkgdb.byfile.db`, measured with `hyperfine` via `tools/bench.sh`:
+
+| workload                       | C (`pkg_install` / `libnbcompat`) | Rust (`db185`) | speedup |
+|--------------------------------|-----------------------------------|----------------|---------|
+| Full dump (read + iterate)     | ~34 ms                            | ~14 ms         | 2.47x   |
+| Replay rebuild trace (writer)  | ~164 ms                           | ~78 ms         | 2.11x   |
+| End-to-end `pkg_admin rebuild` | ~514 ms                           | ~558 ms        | 0.92x   |
+
+The end-to-end rebuild row is slower in Rust because of overhead in
+`pkgsrc-rs`'s filesystem walk and `+CONTENTS` parsing, not in db185 itself.
+This will be fixed in due course.

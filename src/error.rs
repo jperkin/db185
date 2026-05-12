@@ -54,6 +54,17 @@ pub enum Error {
         psize: u32,
     },
 
+    /// File length is not an exact multiple of the meta page's
+    /// declared page size, so the file cannot be a valid sequence
+    /// of `psize`-byte pages.
+    #[error("file length {len} is not a multiple of page size {psize}")]
+    UnalignedFileLength {
+        /// File length in bytes.
+        len: u64,
+        /// Page size read from the meta page, in bytes.
+        psize: u32,
+    },
+
     /// Metadata flags include bits this implementation cannot interpret.
     /// Currently only `B_NODUPS` and `R_RECNO` are recognised, and
     /// `R_RECNO` indicates a recno tree which we do not support.
@@ -85,5 +96,31 @@ pub enum Error {
     CorruptOverflow {
         /// First page number of the malformed chain.
         pgno: u32,
+    },
+
+    /// Writer was asked to insert a key/value pair that this
+    /// writer cannot represent inline anywhere it might need to
+    /// appear in the tree, given the lack of `P_BIGKEY` /
+    /// `P_BIGDATA` overflow support.  Two bounds are enforced up
+    /// front (see `Writer::put`), either of which can fire:
+    ///
+    /// 1. The `BLEAF` entry (`align(9 + key.len() + val.len())`)
+    ///    plus its `linp[]` slot must fit a fresh empty leaf.
+    /// 2. The same key may become a `BINTERNAL` separator at every
+    ///    level above the leaf.  The most constrained context is
+    ///    the root-split conversion, which packs the new separator
+    ///    alongside a zero-key entry and two `linp` slots on a
+    ///    fresh page.
+    ///
+    /// `dbopen(3)`'s btree handles (1) and (2) via `P_BIGKEY` /
+    /// `P_BIGDATA` overflow chains; the writer rejects up front
+    /// rather than risk an unrecoverable split partway through.
+    /// See the crate-level docs.
+    #[error("entry too large for inline storage (key={key_len}B, val={val_len}B)")]
+    EntryTooLarge {
+        /// Key length in bytes.
+        key_len: usize,
+        /// Value length in bytes.
+        val_len: usize,
     },
 }

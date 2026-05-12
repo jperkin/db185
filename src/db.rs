@@ -32,7 +32,7 @@ use crate::format::{
 };
 use crate::iter::{Entry, Iter};
 use crate::page::{ItemRef, PageView};
-use memmap2::{Advice, Mmap};
+use memmap2::Mmap;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fs::File;
@@ -60,9 +60,8 @@ impl Db {
     /// Open `path` for reading.
     ///
     /// Maps the file with `mmap(2)` and validates the meta page.
-    /// Recno trees ([`crate::format::R_RECNO`]) are rejected; btree
-    /// pages themselves are validated lazily on first access via
-    /// [`PageView::parse`].
+    /// Recno trees are rejected; btree pages themselves are
+    /// validated lazily on first access.
     ///
     /// See the [`Db`] type-level documentation for the `mmap`
     /// concurrent-writer invariant the caller must uphold.
@@ -72,17 +71,15 @@ impl Db {
     /// Returns [`Error::Io`] if the file cannot be opened or mapped,
     /// or [`Error::ShortFile`] if it is too small to contain a meta
     /// page.  Returns [`Error::BadMagic`], [`Error::BadVersion`],
-    /// [`Error::BadPageSize`] or [`Error::UnsupportedFlags`] when the
-    /// meta page is recognisable but its contents fall outside the
-    /// supported subset.
+    /// [`Error::BadPageSize`], [`Error::UnsupportedFlags`] or
+    /// [`Error::UnalignedFileLength`] when the meta page is
+    /// recognisable but its contents fall outside the supported
+    /// subset.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path.as_ref())?;
         // SAFETY: see the `Db` type-level docs - the caller is
         // responsible for ensuring no concurrent writers to the file.
         let mmap = unsafe { Mmap::map(&file)? };
-        // Best-effort prefetch hint; ignored on platforms (e.g.
-        // macOS) where the underlying `madvise` is a no-op.
-        let _ = mmap.advise(Advice::Sequential);
 
         let hdr: &[u8; META_SIZE] = mmap.first_chunk().ok_or(Error::ShortFile)?;
         let (meta, swap) = Meta::parse(hdr);
@@ -101,6 +98,12 @@ impl Db {
         }
         if meta.flags & !SAVEMETA != 0 || meta.flags & R_RECNO != 0 {
             return Err(Error::UnsupportedFlags { flags: meta.flags });
+        }
+        if mmap.len() % psize != 0 {
+            return Err(Error::UnalignedFileLength {
+                len: mmap.len() as u64,
+                psize: meta.psize,
+            });
         }
         Ok(Self { mmap, psize, swap })
     }
@@ -242,16 +245,71 @@ impl Db {
         Ok(view.internal_entry(chosen)?.child)
     }
 
-    /// Compare a user key against an [`ItemRef`] decoded from `view`,
-    /// materialising overflow keys as needed.
+    /// Compare a user key against an [`ItemRef`] decoded from `view`.
+    ///
+    /// Inline items compare directly against the borrowed slice.
+    /// Overflow items stream through the page chain a page at a
+    /// time, comparing each segment without allocating the full
+    /// key into a temporary `Vec`.  That matters for hot lookup
+    /// paths: a binary search at a non-trivial level would
+    /// otherwise allocate (and re-fetch) the whole key on every
+    /// comparison.
     fn compare_item(&self, key: &[u8], view: &PageView<'_>, item: ItemRef) -> Result<Ordering> {
         match item {
             ItemRef::Inline { .. } => Ok(key.cmp(view.inline(item)?)),
-            ItemRef::Overflow { pgno, size } => {
-                let other = self.fetch_overflow(pgno, size)?;
-                Ok(key.cmp(other.as_slice()))
-            }
+            ItemRef::Overflow { pgno, size } => self.compare_overflow(key, pgno, size),
         }
+    }
+
+    /// Streaming comparison of `key` against the overflow chain
+    /// starting at `start_pgno` whose total declared payload
+    /// length is `size`.  Walks at most as many pages as needed
+    /// to find the first differing byte (or to exhaust the
+    /// shorter side), without ever materialising the full
+    /// overflow key into a `Vec`.  Matches `<[u8] as Ord>::cmp`
+    /// semantics: byte-by-byte, then shorter-wins.
+    fn compare_overflow(&self, key: &[u8], start_pgno: u32, size: u32) -> Result<Ordering> {
+        let payload_per_page = self.psize - PAGE_HEADER_SIZE;
+        let total = size as usize;
+        let mut pgno = start_pgno;
+        let mut consumed = 0usize;
+        while consumed < total {
+            if pgno == P_INVALID {
+                return Err(Error::CorruptOverflow { pgno: start_pgno });
+            }
+            let view = PageView::parse(pgno, self.page(pgno)?, self.swap)?;
+            if !view.is_overflow() {
+                return Err(Error::CorruptOverflow { pgno: start_pgno });
+            }
+            let take = (total - consumed).min(payload_per_page);
+            let payload = view.overflow_payload();
+            if take > payload.len() {
+                return Err(Error::CorruptOverflow { pgno: start_pgno });
+            }
+            let other = &payload[..take];
+
+            if consumed >= key.len() {
+                // `key` ran out earlier; the overflow side has
+                // more bytes to come -> `key` is shorter.
+                return Ok(Ordering::Less);
+            }
+            let key_rest = &key[consumed..];
+            let cmp_len = key_rest.len().min(other.len());
+            match key_rest[..cmp_len].cmp(&other[..cmp_len]) {
+                Ordering::Equal => {}
+                ord => return Ok(ord),
+            }
+            if key_rest.len() < other.len() {
+                // `key` exhausted partway through this page.
+                return Ok(Ordering::Less);
+            }
+            consumed += take;
+            pgno = view.next_pg;
+        }
+        // Whole overflow consumed without a mismatch; final
+        // ordering is determined by whether `key` had extra
+        // trailing bytes.
+        Ok(key.len().cmp(&total))
     }
 
     /// Resolve an [`ItemRef`] decoded from `view` into a borrowed or
