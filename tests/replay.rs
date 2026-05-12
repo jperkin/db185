@@ -41,7 +41,7 @@ fn replay_trace_matches_pkg_admin_rebuild() -> Result<()> {
 
     let dir = TempDir::new()?;
     let path = dir.path().join("replay.db");
-    let mut writer = Writer::create(&path)?;
+    let mut writer = Writer::create_new(&path)?;
 
     let mut cursor = 0usize;
     let mut op_index = 0usize;
@@ -71,7 +71,7 @@ fn replay_trace_matches_pkg_admin_rebuild() -> Result<()> {
         }
         op_index += 1;
     }
-    writer.close()?;
+    writer.finish()?;
 
     let ours = std::fs::read(&path)?;
 

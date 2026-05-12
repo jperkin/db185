@@ -30,7 +30,7 @@
  *
  * [`Writer`] builds a new file from scratch via a sequence of
  * [`Writer::put`] / [`Writer::del`] operations, flushed on
- * [`Writer::close`].  It does not modify existing files, and writes
+ * [`Writer::finish`].  It does not modify existing files, and writes
  * native-endian only (the reader handles both byte orders).
  *
  * Each key/value pair must fit in a single page (~4 KiB); larger
@@ -87,7 +87,7 @@ mod writer;
 pub use db::Db;
 pub use error::Error;
 pub use iter::{Entry, Iter};
-pub use writer::{PutResult, Writer};
+pub use writer::Writer;
 
 /// Result alias for fallible operations in this crate.
 pub type Result<T> = std::result::Result<T, Error>;

@@ -17,14 +17,14 @@
 //! Writer round-trip tests.
 
 use anyhow::{Context, Result};
-use db185::{Db, PutResult, Writer};
+use db185::{Db, Writer};
 use tempfile::TempDir;
 
 #[test]
 fn empty_round_trip() -> Result<()> {
     let dir = TempDir::new()?;
     let path = dir.path().join("empty.db");
-    Writer::create(&path)?.close()?;
+    Writer::create_new(&path)?.finish()?;
 
     let db = Db::open(&path)?;
     assert!(
@@ -39,9 +39,9 @@ fn empty_round_trip() -> Result<()> {
 fn put_round_trip_single_entry() -> Result<()> {
     let dir = TempDir::new()?;
     let path = dir.path().join("one.db");
-    let mut w = Writer::create(&path)?;
-    assert_eq!(w.put(b"hello\0", b"world\0")?, PutResult::Inserted);
-    w.close()?;
+    let mut w = Writer::create_new(&path)?;
+    assert!(w.put(b"hello\0", b"world\0")?);
+    w.finish()?;
 
     let db = Db::open(&path)?;
     let val = db.get(b"hello\0")?.context("hello should be present")?;
@@ -54,10 +54,10 @@ fn put_round_trip_single_entry() -> Result<()> {
 fn put_no_overwrite() -> Result<()> {
     let dir = TempDir::new()?;
     let path = dir.path().join("dup.db");
-    let mut w = Writer::create(&path)?;
-    assert_eq!(w.put(b"k\0", b"v1\0")?, PutResult::Inserted);
-    assert_eq!(w.put(b"k\0", b"v2\0")?, PutResult::KeyExists);
-    w.close()?;
+    let mut w = Writer::create_new(&path)?;
+    assert!(w.put(b"k\0", b"v1\0")?);
+    assert!(!w.put(b"k\0", b"v2\0")?);
+    w.finish()?;
 
     let db = Db::open(&path)?;
     let val = db.get(b"k\0")?.context("k should be present")?;
@@ -74,9 +74,9 @@ fn matches_pkg_admin_single_entry() -> Result<()> {
 
     let dir = TempDir::new()?;
     let path = dir.path().join("ours.db");
-    let mut w = Writer::create(&path)?;
-    assert_eq!(w.put(b"/tmp/hello\0", b"foo-1.0\0")?, PutResult::Inserted);
-    w.close()?;
+    let mut w = Writer::create_new(&path)?;
+    assert!(w.put(b"/tmp/hello\0", b"foo-1.0\0")?);
+    w.finish()?;
     let ours = std::fs::read(&path)?;
     assert_eq!(
         ours, REFERENCE,
@@ -98,14 +98,14 @@ fn matches_pkg_admin_one_split() -> Result<()> {
 
     let dir = TempDir::new()?;
     let path = dir.path().join("ours.db");
-    let mut w = Writer::create(&path)?;
+    let mut w = Writer::create_new(&path)?;
     for i in 1..=39 {
         let mut key = PREFIX.as_bytes().to_vec();
         key.extend_from_slice(format!("file_with_a_somewhat_long_name_{i:03}").as_bytes());
         key.push(0);
-        assert_eq!(w.put(&key, b"big-1.0\0")?, PutResult::Inserted);
+        assert!(w.put(&key, b"big-1.0\0")?);
     }
-    w.close()?;
+    w.finish()?;
     let ours = std::fs::read(&path)?;
     assert_eq!(ours.len(), REFERENCE.len(), "writer output length differs");
     assert_eq!(
@@ -124,14 +124,14 @@ fn matches_pkg_admin_one_split() -> Result<()> {
 fn delete_then_split_via_reader() -> Result<()> {
     let dir = TempDir::new()?;
     let path = dir.path().join("del_then_split.db");
-    let mut w = Writer::create(&path)?;
+    let mut w = Writer::create_new(&path)?;
     let prefix = "/tmp/del-split/path/to/some/directory/file_";
     let mut keys: Vec<Vec<u8>> = Vec::new();
     for i in 0..200 {
         let mut k = prefix.as_bytes().to_vec();
         k.extend_from_slice(format!("{i:04}_with_padding_to_force_splits").as_bytes());
         k.push(0);
-        assert_eq!(w.put(&k, b"pkg-1.0\0")?, PutResult::Inserted);
+        assert!(w.put(&k, b"pkg-1.0\0")?);
         keys.push(k);
     }
     // Delete every 7th entry, then insert that key back with a
@@ -143,10 +143,10 @@ fn delete_then_split_via_reader() -> Result<()> {
     }
     for (i, k) in keys.iter().enumerate() {
         if i % 7 == 0 {
-            assert_eq!(w.put(k, b"pkg-2.0-replacement\0")?, PutResult::Inserted);
+            assert!(w.put(k, b"pkg-2.0-replacement\0")?);
         }
     }
-    w.close()?;
+    w.finish()?;
 
     let db = Db::open(&path)?;
     let mut prev: Option<Vec<u8>> = None;
@@ -173,13 +173,13 @@ fn delete_then_split_via_reader() -> Result<()> {
 fn sorted_append_grows_rightmost_leaf_chain() -> Result<()> {
     let dir = TempDir::new()?;
     let path = dir.path().join("sorted.db");
-    let mut w = Writer::create(&path)?;
+    let mut w = Writer::create_new(&path)?;
     for i in 0..2000u32 {
         let key = format!("/sorted/{i:08}_some_padding_to_take_real_space\0");
         let val = format!("pkg-{i}\0");
-        assert_eq!(w.put(key.as_bytes(), val.as_bytes())?, PutResult::Inserted,);
+        assert!(w.put(key.as_bytes(), val.as_bytes())?);
     }
-    w.close()?;
+    w.finish()?;
 
     let db = Db::open(&path)?;
     let mut last: Option<u32> = None;
@@ -214,7 +214,7 @@ fn put_oversize_entry_returns_clean_error() -> Result<()> {
     use db185::Error;
     let dir = TempDir::new()?;
     let path = dir.path().join("toobig.db");
-    let mut w = Writer::create(&path)?;
+    let mut w = Writer::create_new(&path)?;
     // 4080-byte key, NUL-terminated value: total entry (header +
     // key + value, aligned to 4 + the 2-byte linp slot) exceeds the
     // 4076-byte usable area of a 4096-byte page.
@@ -224,7 +224,7 @@ fn put_oversize_entry_returns_clean_error() -> Result<()> {
         matches!(err, Error::EntryTooLarge { .. }),
         "expected EntryTooLarge, got {err:?}",
     );
-    w.close()?;
+    w.finish()?;
     Ok(())
 }
 
@@ -240,7 +240,7 @@ fn put_leaf_fittable_but_separator_too_large_errors() -> Result<()> {
     use db185::Error;
     let dir = TempDir::new()?;
     let path = dir.path().join("sep.db");
-    let mut w = Writer::create(&path)?;
+    let mut w = Writer::create_new(&path)?;
     // 4060-byte key: align(9+4060+2)=4072 bytes leaf-entry, +2 linp
     // = 4074 ≤ 4076 usable.  But as a separator: align(9+4060)=4072
     // bytes, + the 12-byte zero-key entry + 4 bytes for 2 linp slots
@@ -251,6 +251,6 @@ fn put_leaf_fittable_but_separator_too_large_errors() -> Result<()> {
         matches!(err, Error::EntryTooLarge { .. }),
         "expected EntryTooLarge for separator-overflowing key, got {err:?}",
     );
-    w.close()?;
+    w.finish()?;
     Ok(())
 }

@@ -19,7 +19,7 @@
  * [`Writer::del`] operations.
  *
  * Pages are staged in an in-memory arena indexed by page number and
- * written at close, meta page first.  Split decisions and prefix
+ * written on finish, meta page first.  Split decisions and prefix
  * compression follow `libnbcompat`'s `bt_split.c`, so output matches
  * a fresh `dbopen(3)` rebuild byte-for-byte in active bytes (page
  * headers, `linp[]`, entry headers + keys + values); entry-alignment
@@ -45,40 +45,29 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-/// Result of [`Writer::put`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PutResult {
-    /// The entry was inserted.
-    Inserted,
-    /// The key was already present.  No modification was made
-    /// (matching the `R_NOOVERWRITE` semantics of `dbopen(3)`'s
-    /// `put`).
-    KeyExists,
-}
-
 /// Default page size used for new files.  Matches `pkg_install`,
 /// which always passes `psize = 4096` to `dbopen`.
 const DEFAULT_PSIZE: usize = 4096;
 
 /// Builder for a new btree file.
 ///
-/// `Writer::create(path)` initialises the in-memory state with an
-/// empty root leaf; `close()` flushes that plus the meta page to
-/// disk.  Dropping a `Writer` without calling `close()` leaves the
-/// newly-created file empty on disk - nothing is written until
-/// close.
-#[must_use = "Writer is staged in memory only; call close() to write the database"]
+/// `Writer::create_new(path)` initialises the in-memory state with
+/// an empty root leaf; `finish()` flushes that plus the meta page
+/// to disk.  Dropping a `Writer` without calling `finish()` leaves
+/// the newly-created file empty on disk - nothing is written until
+/// finish.
+#[must_use = "Writer is staged in memory only; call finish() to write the database"]
 pub struct Writer {
     file: File,
     psize: usize,
     /// Flat in-memory page arena: a single `Vec<u8>` holding every
     /// page back-to-back, indexed by `pgno * psize`.  Slot 0 (the
-    /// meta page) is built fresh into the arena head at close;
+    /// meta page) is built fresh into the arena head at finish;
     /// slot 1 is the root.  Pages are always allocated in
     /// increasing pgno order (each new page is appended as
     /// `psize` more bytes onto the end), so a flat buffer is both
     /// the natural shape for `O(1)` random access during descent
-    /// and the cheapest possible flush in [`Writer::close`]: a
+    /// and the cheapest possible flush in [`Writer::finish`]: a
     /// single buffered write of the whole arena.
     pages: Vec<u8>,
     /// Head of the free-page chain, recorded into the meta page.
@@ -150,16 +139,17 @@ impl Writer {
 
     /// Create a new file at `path` and stage an empty btree.
     ///
-    /// The file is opened with `create_new`, so an existing file at
-    /// `path` causes an I/O error.  Nothing is written to disk until
-    /// [`Writer::close`] is called.
+    /// Mirrors [`std::fs::File::create_new`]: the file is opened
+    /// with `create_new`, so an existing file at `path` causes an
+    /// I/O error.  Nothing is written to disk until
+    /// [`Writer::finish`] is called.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Io`] if the file cannot be created.
     ///
     /// [`Error::Io`]: crate::Error::Io
-    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn create_new(path: impl AsRef<Path>) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -220,9 +210,9 @@ impl Writer {
     /// Insert `key` / `val` into the tree.
     ///
     /// Mirrors `dbopen(3)`'s `R_NOOVERWRITE` semantics: returns
-    /// [`PutResult::Inserted`] on a successful insert, or
-    /// [`PutResult::KeyExists`] if `key` is already present (in
-    /// which case the existing value is left untouched).
+    /// `Ok(true)` on a successful insert, or `Ok(false)` if `key`
+    /// is already present (in which case the existing value is
+    /// left untouched).  Matches [`std::collections::HashSet::insert`].
     ///
     /// # Errors
     ///
@@ -239,7 +229,7 @@ impl Writer {
     /// Reaching this branch indicates a bug in this crate.
     ///
     /// [`Error`]: crate::Error
-    pub fn put(&mut self, key: &[u8], val: &[u8]) -> Result<PutResult> {
+    pub fn put(&mut self, key: &[u8], val: &[u8]) -> Result<bool> {
         let psize = self.psize;
         // Reject entries that we couldn't represent inline anywhere
         // in the tree without `P_BIGKEY` / `P_BIGDATA` overflow
@@ -282,17 +272,17 @@ impl Writer {
         let leaf = self.page(leaf_pgno);
         let (exact, idx) = leaf_search(leaf_pgno, leaf, key)?;
         if exact {
-            return Ok(PutResult::KeyExists);
+            return Ok(false);
         }
 
         if leaf.free_space() >= leaf_bytes + 2 {
             insert_leaf_entry(&mut self.page_mut(leaf_pgno), idx, key, val);
-            return Ok(PutResult::Inserted);
+            return Ok(true);
         }
 
         if leaf_pgno == P_ROOT {
             self.split_root_leaf(idx, key, val)?;
-            return Ok(PutResult::Inserted);
+            return Ok(true);
         }
 
         // Non-root leaf split.  Produces a separator that must be
@@ -300,7 +290,7 @@ impl Writer {
         // up the tree).
         let sep = self.split_non_root_leaf(leaf_pgno, idx, key, val)?;
         self.propagate_separator(spine.path, sep)?;
-        Ok(PutResult::Inserted)
+        Ok(true)
     }
 
     /// Descend the tree from the root, returning a [`Spine`] that
@@ -753,11 +743,11 @@ impl Writer {
         Ok(())
     }
 
-    /// Flush all buffered pages to disk.
+    /// Flush all buffered pages to disk, consuming the writer.
     ///
     /// Pages are written in pgno order through a single buffered
     /// writer (no per-page seeks): the in-memory arena is one
-    /// contiguous `psize`-aligned buffer indexed by pgno, so close
+    /// contiguous `psize`-aligned buffer indexed by pgno, so finish
     /// writes the meta page into slot 0 and then flushes the whole
     /// buffer as a single `write_all`.
     ///
@@ -780,7 +770,7 @@ impl Writer {
     /// boundary.
     ///
     /// [`Error::Io`]: crate::Error::Io
-    pub fn close(self) -> Result<()> {
+    pub fn finish(self) -> Result<()> {
         let Self {
             file,
             psize,
